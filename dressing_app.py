@@ -5,6 +5,7 @@
 - 双击运行，弹出窗口显示「默认城市实时气温 + 成套穿衣建议」
 - 平时不驻留后台、不占用内存；关闭窗口即彻底退出
 - 支持手动指定城市 / 手动输入气温（离线可用）
+- 除气温外，同时展示风力、紫外线强度（晒不晒）、湿度，并动态补充防风/防晒/带伞提示
 """
 
 import json
@@ -24,6 +25,7 @@ ACCENT = "#3b82f6"    # 主色
 ACCENT_DARK = "#2563eb"
 TEXT = "#1f2937"      # 主文字
 MUTED = "#7c8493"     # 次要文字
+CHIP_BG = "#eef2f7"   # 信息小标签底色
 FONT = "Microsoft YaHei UI"
 
 # 温度区间 → 成套搭配 (下限, 上限, 搭配, 小贴士)
@@ -46,6 +48,17 @@ WEATHER_ZH = {
     "Patchy rain nearby": "局部阵雨", "Light snow": "小雪", "Snow": "雪",
     "Moderate snow": "中雪", "Heavy snow": "大雪",
 }
+
+# 16 方位风向 → 中文
+WIND_DIR_ZH = {
+    "N": "北", "NNE": "东北偏北", "NE": "东北", "ENE": "东北偏东",
+    "E": "东", "ESE": "东南偏东", "SE": "东南", "SSE": "东南偏南",
+    "S": "南", "SSW": "西南偏南", "SW": "西南", "WSW": "西南偏西",
+    "W": "西", "WNW": "西北偏西", "NW": "西北", "NNW": "西北偏北",
+}
+
+# 蒲福风级阈值（km/h 上限，依次对应 0~12 级）
+WIND_SCALE_THRESHOLD = [1, 6, 12, 20, 29, 39, 50, 62, 75, 89, 103, 118]
 
 
 def pick_outfit(temp):
@@ -74,8 +87,51 @@ def temp_style(temp):
     return "🧊", "#1e3a8a"
 
 
+def wind_scale(kmph):
+    """风速(km/h) → 蒲福风级 0~12。"""
+    for lv, thr in enumerate(WIND_SCALE_THRESHOLD):
+        if kmph < thr:
+            return lv
+    return 12
+
+
+def uv_info(uv):
+    """紫外线指数 → (颜色, 晒不晒描述)。"""
+    if uv is None:
+        return "#64748b", "--"
+    if uv <= 2:
+        return "#16a34a", "不晒"
+    if uv <= 5:
+        return "#ca8a04", "有点晒"
+    if uv <= 7:
+        return "#f97316", "较晒"
+    if uv <= 10:
+        return "#ef4444", "很晒"
+    return "#9333ea", "极晒"
+
+
+def build_tips(base_tip, desc, temp, wind_kmph, uv):
+    """动态组合小贴士：基础搭配提示 + 雨雪/大风/紫外线提醒。"""
+    tips = []
+    if base_tip:
+        tips.append(base_tip)
+    if desc:
+        if "雨" in desc:
+            tips.append("☔ 有雨，出门记得带伞")
+        if "雪" in desc:
+            tips.append("❄️ 有雪，注意保暖防滑")
+    if wind_kmph is not None and wind_kmph >= 20:
+        lv = wind_scale(wind_kmph)
+        if temp < 24:
+            tips.append(f"💨 风力{lv}级较大，体感比气温更低，注意防风")
+    if uv is not None and uv >= 6:
+        lv_txt = "强" if uv <= 7 else "很强" if uv <= 10 else "极强"
+        tips.append(f"☀️ 紫外线{lv_txt}（UV {uv}），出门注意防晒")
+    return "\n".join(tips)
+
+
 def fetch_weather(city):
-    """通过 wttr.in 获取气温，返回 dict。"""
+    """通过 wttr.in 获取天气，返回 dict。"""
     target = urllib.parse.quote(city) if city else ""
     url = f"https://wttr.in/{target}?format=j1"
     req = urllib.request.Request(url, headers={"User-Agent": "curl/8.0"})
@@ -83,12 +139,25 @@ def fetch_weather(city):
         data = json.loads(resp.read().decode("utf-8"))
     c = data["current_condition"][0]
     na = data["nearest_area"][0]
+
     desc = None
     if c.get("lang_zh"):
         desc = c["lang_zh"][0].get("value")
     if not desc and c.get("weatherDesc"):
-        raw = c["weatherDesc"][0].get("value", "")
+        raw = c["weatherDesc"][0].get("value", "").strip()
         desc = WEATHER_ZH.get(raw, raw)
+
+    uv_raw = c.get("uvIndex")
+    try:
+        uv = int(uv_raw)
+    except (TypeError, ValueError):
+        uv = None
+
+    try:
+        wind_kmph = int(float(c.get("windspeedKmph") or 0))
+    except (TypeError, ValueError):
+        wind_kmph = None
+
     return {
         "temp": float(c["temp_C"]),
         "feels": c.get("FeelsLikeC"),
@@ -96,6 +165,9 @@ def fetch_weather(city):
         "desc": desc,
         "area": na["areaName"][0]["value"],
         "region": na["region"][0]["value"],
+        "wind_kmph": wind_kmph,
+        "wind_dir": c.get("winddir16Point") or "",
+        "uv": uv,
     }
 
 
@@ -103,7 +175,7 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("穿衣建议")
-        self.geometry("460x400")
+        self.geometry("470x460")
         self.resizable(False, False)
         self.configure(bg=BG)
         self._build_ui()
@@ -164,39 +236,54 @@ class App(tk.Tk):
         tk.Label(r2, text="℃", font=(FONT, 11), bg=CARD, fg=MUTED).pack(side="left")
         self._btn(r2, "按气温查", self.query_temp, width=8).pack(side="right")
 
-        # 结果卡片
+        # 结果卡片（grid 布局，便于动态显隐环境信息行）
         rcard = self._card(body)
         rcard.pack(fill="both", expand=True, pady=(12, 0))
+        rcard.grid_columnconfigure(0, weight=1)
+        rcard.grid_rowconfigure(7, weight=1)
 
         top = tk.Frame(rcard, bg=CARD)
-        top.pack(fill="x", padx=16, pady=(14, 0))
-        self.loc_label = tk.Label(top, text="", font=(FONT, 10),
-                                  bg=CARD, fg=MUTED)
+        top.grid(row=0, column=0, sticky="ew", padx=16, pady=(14, 0))
+        self.loc_label = tk.Label(top, font=(FONT, 10), bg=CARD, fg=MUTED)
         self.loc_label.pack(anchor="w")
 
         temp_row = tk.Frame(rcard, bg=CARD)
-        temp_row.pack(fill="x", padx=16, pady=(2, 0))
-        self.emoji_label = tk.Label(temp_row, text="", font=(FONT, 24), bg=CARD)
+        temp_row.grid(row=1, column=0, sticky="ew", padx=16, pady=(2, 0))
+        self.emoji_label = tk.Label(temp_row, font=(FONT, 24), bg=CARD)
         self.emoji_label.pack(side="left")
-        self.temp_label = tk.Label(temp_row, text="--℃", font=(FONT, 32, "bold"),
+        self.temp_label = tk.Label(temp_row, font=(FONT, 32, "bold"),
                                    bg=CARD, fg=ACCENT)
         self.temp_label.pack(side="left", padx=(4, 0))
-        self.desc_label = tk.Label(temp_row, text="", font=(FONT, 11),
-                                   bg=CARD, fg=MUTED)
-        self.desc_label.pack(side="left", padx=(10, 0), pady=(10, 0))
+        self.desc_label = tk.Label(temp_row, font=(FONT, 11), bg=CARD, fg=MUTED)
+        self.desc_label.pack(side="left", padx=(10, 0), pady=(12, 0))
+
+        # 环境信息行：风力 / 紫外线 / 湿度
+        self.env_row = tk.Frame(rcard, bg=CARD)
+        self.env_row.grid(row=2, column=0, sticky="ew", padx=16, pady=(6, 0))
+        self.wind_chip = tk.Label(self.env_row, text="", bg=CHIP_BG, fg="#475569",
+                                  font=(FONT, 9), padx=8, pady=3)
+        self.wind_chip.pack(side="left")
+        self.sun_chip = tk.Label(self.env_row, text="", bg=CHIP_BG, fg="#475569",
+                                 font=(FONT, 9), padx=8, pady=3)
+        self.sun_chip.pack(side="left", padx=(6, 0))
+        self.hum_chip = tk.Label(self.env_row, text="", bg=CHIP_BG, fg="#475569",
+                                 font=(FONT, 9), padx=8, pady=3)
+        self.hum_chip.pack(side="left", padx=(6, 0))
+        self.env_row.grid_remove()  # 默认隐藏，查询成功才显示
 
         # 分隔线
-        tk.Frame(rcard, bg=BORDER, height=1).pack(fill="x", padx=16, pady=10)
+        tk.Frame(rcard, bg=BORDER, height=1).grid(row=3, column=0,
+                                                  sticky="ew", padx=16, pady=10)
 
         tk.Label(rcard, text="建议搭配", font=(FONT, 9), bg=CARD,
-                 fg=MUTED).pack(anchor="w", padx=16)
-        self.outfit_label = tk.Label(rcard, text="", font=(FONT, 13, "bold"),
+                 fg=MUTED).grid(row=4, column=0, sticky="w", padx=16)
+        self.outfit_label = tk.Label(rcard, font=(FONT, 13, "bold"),
                                      bg=CARD, fg=TEXT, justify="left",
-                                     wraplength=400)
-        self.outfit_label.pack(anchor="w", padx=16, pady=(2, 0))
-        self.tip_label = tk.Label(rcard, text="", font=(FONT, 10), bg=CARD,
-                                  fg=MUTED, justify="left", wraplength=400)
-        self.tip_label.pack(anchor="w", padx=16, pady=(2, 14))
+                                     wraplength=420)
+        self.outfit_label.grid(row=5, column=0, sticky="w", padx=16, pady=(2, 0))
+        self.tip_label = tk.Label(rcard, font=(FONT, 10), bg=CARD,
+                                  fg=MUTED, justify="left", wraplength=420)
+        self.tip_label.grid(row=6, column=0, sticky="nw", padx=16, pady=(2, 14))
 
         # 状态栏
         self.status_label = tk.Label(self, text="", font=(FONT, 9), bg=BG,
@@ -206,6 +293,26 @@ class App(tk.Tk):
     # ---------- 逻辑 ----------
     def _set_status(self, text):
         self.status_label.config(text=text)
+
+    def _set_env(self, w):
+        """填充并显示环境信息行。w 为 fetch_weather 返回的 dict。"""
+        wind_txt = ""
+        if w.get("wind_kmph") is not None:
+            lv = wind_scale(w["wind_kmph"])
+            dir_zh = WIND_DIR_ZH.get(w.get("wind_dir") or "", "")
+            prefix = f"{dir_zh}风" if dir_zh else "风"
+            wind_txt = f"💨 {prefix} {lv}级 · {w['wind_kmph']}km/h"
+        self.wind_chip.config(text=wind_txt or "💨 风力 --")
+
+        uv = w.get("uv")
+        color, txt = uv_info(uv)
+        self.sun_chip.config(text=f"☀️ 紫外线 {uv if uv is not None else '--'} · {txt}",
+                             fg=color)
+
+        hum = w.get("humidity")
+        self.hum_chip.config(text=f"💧 湿度 {hum}%" if hum else "💧 湿度 --")
+
+        self.env_row.grid()
 
     def query_city(self):
         city = self.city_var.get().strip()
@@ -226,25 +333,27 @@ class App(tk.Tk):
     def _render_weather(self, city, w):
         self.query_btn.config(state="normal")
         temp = w["temp"]
-        outfit, tip = pick_outfit(temp)
+        outfit, base_tip = pick_outfit(temp)
         emoji, color = temp_style(temp)
 
         parts = [city]
         if w.get("feels"):
             parts.append(f"体感 {w['feels']}℃")
-        if w.get("humidity"):
-            parts.append(f"湿度 {w['humidity']}%")
         self.loc_label.config(text=" · ".join(parts))
 
         self.emoji_label.config(text=emoji)
         self.temp_label.config(text=f"{temp:.0f}℃", fg=color)
         self.desc_label.config(text=w.get("desc") or "")
         self.outfit_label.config(text=outfit, fg=TEXT)
-        self.tip_label.config(text=tip if tip else "")
+        self.tip_label.config(
+            text=build_tips(base_tip, w.get("desc"), temp,
+                            w.get("wind_kmph"), w.get("uv")))
+        self._set_env(w)
         self._set_status("查询成功 · 关闭窗口即可退出")
 
     def _render_error(self, msg):
         self.query_btn.config(state="normal")
+        self.env_row.grid_remove()
         self.outfit_label.config(text=msg, fg="#c0392b")
         self.tip_label.config(text="")
         self._set_status("")
@@ -256,14 +365,15 @@ class App(tk.Tk):
         except ValueError:
             self._set_status("气温请输入数字，如 18")
             return
-        outfit, tip = pick_outfit(temp)
+        outfit, base_tip = pick_outfit(temp)
         emoji, color = temp_style(temp)
         self.loc_label.config(text="手动输入")
         self.emoji_label.config(text=emoji)
         self.temp_label.config(text=f"{temp:.0f}℃", fg=color)
         self.desc_label.config(text="")
         self.outfit_label.config(text=outfit, fg=TEXT)
-        self.tip_label.config(text=tip if tip else "")
+        self.tip_label.config(text=base_tip if base_tip else "")
+        self.env_row.grid_remove()
         self._set_status("已按手动气温给出建议")
 
 
